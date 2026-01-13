@@ -1,0 +1,40 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Executables
+*.exe
+*.out
+*.app
+simulator
+# ^ We explicitly ignore "simulator" since that is your output name
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# Build directories (if you use them later)
+build/
+bin/
+debug/
+release/
+
+# VS Code settings (optional, but recommended for team projects)
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
