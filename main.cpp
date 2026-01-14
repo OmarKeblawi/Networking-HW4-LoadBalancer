@@ -1,303 +1,266 @@
 #include <iostream>
+#include <vector>
 #include <queue>
 #include <random>
 #include <cmath>
 #include <iomanip>
+#include <deque>
+#include <algorithm> // For max
 
 using namespace std;
 
 // ********** Event Types **********
-
 enum EventType {
-    ARRIVAL,
-    DEPARTURE
+    ARRIVAL,    // Global arrival to Load Balancer
+    DEPARTURE   // Departure from a specific server
 };
 
-// ********** Event struct - each event has a time and a type **********
-
+// ********** Event Struct **********
 struct Event {
-    double time;           // Time when event occurs
+    double time;
     EventType type;
-    double arrival_time;   // זמן ההגעה של הלקוח
+    int server_index;       // -1 for ARRIVAL, 0 to M-1 for DEPARTURE
+    double arrival_time;    // Timestamp when the request entered the system
+    double service_duration;// Duration of the service (only relevant for DEPARTURE)
 
     // Constructor
-    Event(double t, EventType tp, double at = 0.0) : time(t), type(tp), arrival_time(at) {}
+    Event(double t, EventType tp, int s_idx = -1, double arr_t = 0.0, double serv_dur = 0.0)
+        : time(t), type(tp), server_index(s_idx), arrival_time(arr_t), service_duration(serv_dur) {}
 
-    // comparison operator
+    // Priority Queue comparison (Min-Heap based on time)
     bool operator>(const Event& other) const {
         return time > other.time;
     }
 };
 
-// ********** MMN1Queue Class -  class for M/M/1/N queue **********
+// ********** Global Variables for Randomness **********
+// We need a single source of randomness to ensure independent streams if needed,
+// but for this simple simulation, a shared generator is sufficient.
+mt19937 rng;
 
-class MMN1Queue {
+// ********** Server Class **********
+class Server {
 private:
-    // Simulation parameters
-    double lambda_rate;    // Arrival rate (λ)
-    double mu_rate;        // Service rate (μ)
-    int N;                 // Maximum capacity
-    double T;              // Simulation time
-
-    // current System state
-    double current_time;
-    int num_in_system;     // How many customers currently in system (queue + service)
-    bool server_busy;      // Is the server busy
-
-    // Statistics
-    int customers_served;           // A - how many customers received full service
-    int customers_blocked;          // Part of B - customers rejected because queue was full
-    int customers_in_system_at_end; // Part of B - customers remaining at end
-    double total_time_in_system;    // סכום זמני ההמתנה של כל הלקוחות
-
-    // תור של זמני הגעה אמיתיים של לקוחות
-    queue<double> arrival_times;
-
-    // a priorety queue to handle the events , implemented with a vector of events
-    // and the comparison func is the built in function greater
-    // ( uses the comparison operator of the event => greater by time )
-    //this will ensure that the event with the earliest time will be on the top
-    priority_queue<Event, vector<Event>, greater<Event>> event_queue;
-
-    // Random number generator - למשתנים אקראיים
-    mt19937 rng;
+    int id;
+    int capacity;       // Q_i + 1 (Queue size + 1 for service)
+    double mu_rate;     // Service rate
+    
+    // Internal state
+    int num_in_system;  // Current number of requests (Queue + Service)
+    bool busy;          // Is the server currently processing?
+    deque<double> waiting_queue; // Stores arrival times of requests in queue
 
 public:
+    // Statistics for this server
+    int served_count;
+    int dropped_count; // Dropped due to full queue
+    double total_wait_time; // Sum of (Start Service Time - Arrival Time)
+    double total_service_time; // Sum of Service Durations
 
-    // Constructor - Initialize the simulation
+    Server(int server_id, int Q, double mu) 
+        : id(server_id), capacity(Q + 1), mu_rate(mu), 
+          num_in_system(0), busy(false),
+          served_count(0), dropped_count(0), total_wait_time(0), total_service_time(0) {}
 
-    MMN1Queue(double lambda, double mu, int n, double t, unsigned int seed = 0)
-        : lambda_rate(lambda), mu_rate(mu), N(n), T(t),
-          current_time(0.0), num_in_system(0), server_busy(false),
-          customers_served(0), customers_blocked(0),
-          customers_in_system_at_end(0), total_time_in_system(0.0) {
+    // Attempt to accept a request
+    // Returns true if accepted, false if dropped (queue full)
+    bool accept_arrival(double current_time, priority_queue<Event, vector<Event>, greater<Event>>& pq) {
+        if (num_in_system >= capacity) {
+            dropped_count++;
+            return false;
+        }
 
-        // Initialize random number generator
-        if (seed == 0) {
-            random_device rd;
-            rng.seed(rd());
+        num_in_system++;
+
+        if (!busy) {
+            // Start service immediately
+            busy = true;
+            double service_time = generate_service_time();
+            
+            // Schedule departure
+            // Wait time is 0 because it started immediately
+            // We store service_time in the event to log it later
+            pq.push(Event(current_time + service_time, DEPARTURE, id, current_time, service_time));
         } else {
-            rng.seed(seed);
+            // Queue the request
+            waiting_queue.push_back(current_time);
+        }
+        return true;
+    }
+
+    // Handle departure
+    void handle_departure(double current_time, double arrival_time, double service_duration, 
+                          priority_queue<Event, vector<Event>, greater<Event>>& pq) {
+        num_in_system--;
+        served_count++;
+        
+        // Update stats
+        // Wait Time = (Departure Time - Service Duration) - Arrival Time
+        // Effectively: Start_Service_Time - Arrival_Time
+        double start_service_time = current_time - service_duration;
+        double wait_time = start_service_time - arrival_time;
+        
+        total_wait_time += wait_time;
+        total_service_time += service_duration;
+
+        // Check if there are more requests in queue
+        if (!waiting_queue.empty()) {
+            // Start processing next one
+            double next_arrival_time = waiting_queue.front();
+            waiting_queue.pop_front();
+            
+            double next_service_time = generate_service_time();
+            
+            // Schedule next departure
+            pq.push(Event(current_time + next_service_time, DEPARTURE, id, next_arrival_time, next_service_time));
+            // busy remains true
+        } else {
+            busy = false;
         }
     }
 
- //In Poisson process with rate λ, inter-arrival times are exponentially
- //distributed with parameter λ. Using C++11's exponential_distribution
-    /* from lectures : What is the distribution of the time interval between two Poisson arrivals?
-    P(time between arrivals <= t)= 1 - P(time between arrivals> t)= 1 - P0(t) = 1 - exp(-λt)
-             This is an exponential distribution
-            */
-
-    double generate_interarrival_time() {
-        exponential_distribution<double> exp_dist(lambda_rate);
-        return exp_dist(rng);
-    }
-
-    /*
-     * Generate random service time - exponentially distributed with rate μ
-     */
     double generate_service_time() {
         exponential_distribution<double> exp_dist(mu_rate);
         return exp_dist(rng);
     }
-
-    //Schedule a new event in the event queue
-
-    void schedule_event(double event_time, EventType event_type, double arrival_time = 0.0) {
-        event_queue.push(Event(event_time, event_type, arrival_time));
-    }
-
-    /*
-     * Handle arrival event
-     */
-    void handle_arrival() {
-        if (num_in_system < N) {
-            // There's room in the system
-            num_in_system++;
-
-            // שומרים את זמן ההגעה של הלקוח
-            arrival_times.push(current_time);
-
-            if (!server_busy) {
-                // Server is idle - start service immediately
-                server_busy = true;
-                double service_time = generate_service_time();
-                double departure_time = current_time + service_time;
-
-                // שולפים את הלקוח שנכנס לשירות
-                double arrival = arrival_times.front();
-                arrival_times.pop();
-
-                // Schedule the service completion
-                schedule_event(departure_time, DEPARTURE, arrival);
-            }
-            // Otherwise - customer enters queue and waits
-        } else {
-            // No room - customer is blocked
-            customers_blocked++;
-        }
-    }
-
-    /*
-     * Handle departure event
-     */
-    void handle_departure(Event& e) {
-        num_in_system--;
-        customers_served++;
-
-        // חישוב זמן שהלקוח שהסתיים בילה במערכת
-        total_time_in_system += current_time - e.arrival_time;
-
-        // Check if there's another customer waiting
-        if (num_in_system > 0) {
-            // There are more customers - start serving the next one
-            // The customer must have been waiting in queue, so start service now
-            double service_time = generate_service_time();
-            double departure_time = current_time + service_time;
-
-            // שולפים את הלקוח הבא מהתור
-            double arrival = arrival_times.front();
-            arrival_times.pop();
-
-            schedule_event(departure_time, DEPARTURE, arrival);
-            // Server stays busy
-        } else {
-            // No more customers - server becomes idle
-            server_busy = false;
-        }
-    }
-
-    // the actual simulation process
-    void run(int& A, int& B, double& avg_wait_time) {
-        // Initialize: schedule the first arrival
-        double first_arrival_time = generate_interarrival_time();
-        schedule_event(first_arrival_time, ARRIVAL);
-
-        // Main event loop
-        while (!event_queue.empty()) {
-            // Extract next event (earliest time)
-            Event current_event = event_queue.top();
-            event_queue.pop();
-
-            // Check if we've passed simulation time
-            if (current_event.time > T) {
-                // Simulation time ended
-                // Whatever remains in events won't happen
-                break;
-            }
-
-            // Update current clock
-            current_time = current_event.time;
-
-            // Handle event based on type
-            if (current_event.type == ARRIVAL) {
-                handle_arrival();
-
-                // Schedule next arrival (if we haven't reached T yet)
-                double next_arrival_time = current_time + generate_interarrival_time();
-                if (next_arrival_time <= T) {
-                    schedule_event(next_arrival_time, ARRIVAL);
-                }
-
-            } else if (current_event.type == DEPARTURE) {
-                handle_departure(current_event);
-            }
-        }
-
-        // End of simulation - count who's left
-        customers_in_system_at_end = num_in_system;
-
-        // Calculate results
-        A = customers_served;
-        B = customers_blocked + customers_in_system_at_end;
-
-        // חשב את זמן ההמתנה הממוצע
-        avg_wait_time = (customers_served > 0) ? total_time_in_system / customers_served : 0.0;
-    }
 };
 
+// ********** Helper Functions **********
 
-//for section 3.5
-void run_experiment() {
-    const double lambda = 10.0;
-    const double mu = 15.0;
-    const int N = 1000;
-
-    const double theoretical_avg_wait = 1.0 / (mu - lambda); // M/M/1 approximation
-    const double theoretical_A_per_T = lambda;               // E[A] = λ·T
-
-    cout << fixed << setprecision(4);
-    cout << "T   | Avg RelErr_A (%) | Avg RelErr_W (%)\n";
-    cout << "-----------------------------------------\n";
-
-    for (int T = 10; T <= 100; T += 10) {
-        double sum_err_A = 0.0;
-        double sum_err_W = 0.0;
-
-        for (int run = 1; run <= 20; ++run) {
-            MMN1Queue q(lambda, mu, N, T, run); // use run as seed
-            int A, B;
-            double avg_wait;
-            q.run(A, B, avg_wait);
-
-            double err_A = fabs(theoretical_A_per_T * T - A) /(theoretical_A_per_T * T) * 100.0;
-            double err_W = fabs(theoretical_avg_wait - avg_wait) /theoretical_avg_wait * 100.0;
-
-            sum_err_A += err_A;
-            sum_err_W += err_W;
-        }
-
-        // הדפסת ממוצעים בלבד
-        cout << setw(3) << T << " | "
-             << setw(15) << sum_err_A / 20.0 << " | "
-             << setw(15) << sum_err_W / 20.0 << "\n";
-    }
+double generate_interarrival_time(double lambda) {
+    exponential_distribution<double> exp_dist(lambda);
+    return exp_dist(rng);
 }
-//
 
-// ********** Main function **********
+int pick_server(const vector<double>& probs) {
+    uniform_real_distribution<double> dist(0.0, 1.0);
+    double r = dist(rng);
+    double cumulative = 0.0;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        cumulative += probs[i];
+        if (r <= cumulative) {
+            return i;
+        }
+    }
+    return probs.size() - 1; // Fallback for rounding errors
+}
+
+// ********** Main **********
 
 int main(int argc, char* argv[]) {
-//for section 3.5
-    if (argc == 1) {
-        run_experiment();
-        return 0;
-    }
-//
+    // Seed RNG
+    random_device rd;
+    rng.seed(rd());
 
-    // Validate input
-    if (argc != 5) {
-        cerr << "Usage: " << argv[0] << " lambda mu N T" << endl;
-        cerr << "  lambda: arrival rate (messages per time unit)" << endl;
-        cerr << "  mu: service rate (messages per time unit)" << endl;
-        cerr << "  N: number of messages in system (including one in service)" << endl;
-        cerr << "  T: simulation run time" << endl;
+    // 1. Parse Arguments
+    // Expected: ./simulator T M P1...PM lambda Q1...QM mu1...muM
+    
+    // Minimal check: T(1) + M(1) + P(1) + lambda(1) + Q(1) + mu(1) + prog(1) = 7
+    if (argc < 7) {
+        cerr << "Usage: ./simulator T M P1...PM lambda Q1...QM mu1...muM" << endl;
         return 1;
     }
 
-    // Read parameters
-    double lambda_rate = atof(argv[1]);
-    double mu_rate = atof(argv[2]);
-    int N = atoi(argv[3]);
-    double T = atof(argv[4]);
+    int arg_idx = 1;
+    double T = atof(argv[arg_idx++]);
+    int M = atoi(argv[arg_idx++]);
 
-    // Validate values
-    if (lambda_rate <= 0 || mu_rate <= 0 || N <= 0 || T <= 0) {
-        cerr << "Error: All parameters must be positive" << endl;
+    // Check if we have enough arguments based on M
+    // We need M probs, 1 lambda, M Qs, M mus
+    if (argc != (3 + M + 1 + M + M)) {
+        cerr << "Error: Incorrect number of arguments for M=" << M << endl;
         return 1;
     }
 
-    // Create and run simulation
-    // seed = 0 means we'll use random_device for a random seed
-    MMN1Queue queue(lambda_rate, mu_rate, N, T, 0);
-    int A, B;
-    double avg_wait_time;
-    queue.run(A, B, avg_wait_time);
+    vector<double> probs;
+    double prob_sum = 0.0;
+    for (int i = 0; i < M; ++i) {
+        probs.push_back(atof(argv[arg_idx++]));
+        prob_sum += probs.back();
+    }
+    if(abs(prob_sum - 1.0) > 1e-6) {
+        cerr << "Error: Probabilities must sum to 1." << endl;
+        return 1;
+    }
 
-    // Output according to requirements: A B + זמן ההמתנה הממוצע
+    double lambda = atof(argv[arg_idx++]);
+
+    vector<int> queues;
+    for (int i = 0; i < M; ++i) queues.push_back(atoi(argv[arg_idx++]));
+
+    vector<double> mus;
+    for (int i = 0; i < M; ++i) mus.push_back(atof(argv[arg_idx++]));
+
+    // 2. Setup System
+    vector<Server> servers;
+    for (int i = 0; i < M; ++i) {
+        servers.emplace_back(i, queues[i], mus[i]);
+    }
+
+    priority_queue<Event, vector<Event>, greater<Event>> pq;
+
+    // 3. Simulation Loop
+    double current_time = 0.0;
+    double tend = 0.0; // Time of last departure
+
+    // Schedule first arrival
+    double first_arr = generate_interarrival_time(lambda);
+    if (first_arr <= T) {
+        pq.push(Event(first_arr, ARRIVAL));
+    }
+
+    while (!pq.empty()) {
+        Event e = pq.top();
+        pq.pop();
+
+        // Update time
+        current_time = e.time;
+
+        if (e.type == ARRIVAL) {
+            // ARRIVALS stop after time T
+            if (current_time > T) continue;
+
+            // 1. Schedule next arrival
+            double next_arr = current_time + generate_interarrival_time(lambda);
+            if (next_arr <= T) {
+                pq.push(Event(next_arr, ARRIVAL));
+            }
+
+            // 2. Route request to a server
+            int server_idx = pick_server(probs);
+            
+            // 3. Try to add to server
+            servers[server_idx].accept_arrival(current_time, pq);
+
+        } else if (e.type == DEPARTURE) {
+            // Handle departure at specific server
+            int s_idx = e.server_index;
+            servers[s_idx].handle_departure(current_time, e.arrival_time, e.service_duration, pq);
+            
+            // Track last departure time
+            if (current_time > tend) tend = current_time;
+        }
+    }
+
+    // 4. Aggregate Results
+    long long total_A = 0;
+    long long total_B = 0;
+    double total_wait_sum = 0.0;
+    double total_service_sum = 0.0;
+
+    for (const auto& s : servers) {
+        total_A += s.served_count;
+        total_B += s.dropped_count;
+        total_wait_sum += s.total_wait_time;
+        total_service_sum += s.total_service_time;
+    }
+
+    double avg_Tw = (total_A > 0) ? (total_wait_sum / total_A) : 0.0;
+    double avg_Ts = (total_A > 0) ? (total_service_sum / total_A) : 0.0;
+
+    // 5. Output
     cout << fixed << setprecision(4);
-
-    cout << "A = " << A << " B = " << B << " Avg_Waiting_Time = " << avg_wait_time << endl;
+    cout << total_A << " " << total_B << " " << tend << " " << avg_Tw << " " << avg_Ts << endl;
 
     return 0;
 }
