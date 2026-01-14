@@ -5,262 +5,234 @@
 #include <cmath>
 #include <iomanip>
 #include <deque>
-#include <algorithm> // For max
 
 using namespace std;
 
 // ********** Event Types **********
 enum EventType {
-    ARRIVAL,    // Global arrival to Load Balancer
-    DEPARTURE   // Departure from a specific server
+    ARRIVAL,
+    DEPARTURE
 };
 
 // ********** Event Struct **********
 struct Event {
     double time;
     EventType type;
-    int server_index;       // -1 for ARRIVAL, 0 to M-1 for DEPARTURE
-    double arrival_time;    // Timestamp when the request entered the system
-    double service_duration;// Duration of the service (only relevant for DEPARTURE)
+    int server_index;        // -1 for ARRIVAL
+    double arrival_time;
+    double service_duration;
 
-    // Constructor
-    Event(double t, EventType tp, int s_idx = -1, double arr_t = 0.0, double serv_dur = 0.0)
-        : time(t), type(tp), server_index(s_idx), arrival_time(arr_t), service_duration(serv_dur) {}
+    Event(double t, EventType tp, int s = -1, double a = 0.0, double sd = 0.0)
+        : time(t), type(tp), server_index(s), arrival_time(a), service_duration(sd) {}
 
-    // Priority Queue comparison (Min-Heap based on time)
     bool operator>(const Event& other) const {
         return time > other.time;
     }
 };
 
-// ********** Global Variables for Randomness **********
-// We need a single source of randomness to ensure independent streams if needed,
-// but for this simple simulation, a shared generator is sufficient.
+// ********** RNG **********
 mt19937 rng;
 
-// ********** Server Class **********
+// ********** Server **********
 class Server {
-private:
-    int id;
-    int capacity;       // Q_i + 1 (Queue size + 1 for service)
-    double mu_rate;     // Service rate
-    
-    // Internal state
-    int num_in_system;  // Current number of requests (Queue + Service)
-    bool busy;          // Is the server currently processing?
-    deque<double> waiting_queue; // Stores arrival times of requests in queue
-
 public:
-    // Statistics for this server
-    int served_count;
-    int dropped_count; // Dropped due to full queue
-    double total_wait_time; // Sum of (Start Service Time - Arrival Time)
-    double total_service_time; // Sum of Service Durations
+    int id;
+    int capacity;           // Qi + 1
+    double mu;
 
-    Server(int server_id, int Q, double mu) 
-        : id(server_id), capacity(Q + 1), mu_rate(mu), 
+    int num_in_system;
+    bool busy;
+    deque<double> queue;
+
+    long long served;
+    long long dropped;
+    double total_wait;
+    double total_service;
+
+    Server(int i, int Q, double mu_rate)
+        : id(i), capacity(Q + 1), mu(mu_rate),
           num_in_system(0), busy(false),
-          served_count(0), dropped_count(0), total_wait_time(0), total_service_time(0) {}
+          served(0), dropped(0),
+          total_wait(0.0), total_service(0.0) {}
 
-    // Attempt to accept a request
-    // Returns true if accepted, false if dropped (queue full)
-    bool accept_arrival(double current_time, priority_queue<Event, vector<Event>, greater<Event>>& pq) {
+    double gen_service_time() {
+        exponential_distribution<double> d(mu);
+        return d(rng);
+    }
+
+    void accept(double t,
+                priority_queue<Event, vector<Event>, greater<Event>>& pq) {
         if (num_in_system >= capacity) {
-            dropped_count++;
-            return false;
+            dropped++;
+            return;
         }
 
         num_in_system++;
 
         if (!busy) {
-            // Start service immediately
             busy = true;
-            double service_time = generate_service_time();
-            
-            // Schedule departure
-            // Wait time is 0 because it started immediately
-            // We store service_time in the event to log it later
-            pq.push(Event(current_time + service_time, DEPARTURE, id, current_time, service_time));
+            double s = gen_service_time();
+            pq.push(Event(t + s, DEPARTURE, id, t, s));
         } else {
-            // Queue the request
-            waiting_queue.push_back(current_time);
+            queue.push_back(t);
         }
-        return true;
     }
 
-    // Handle departure
-    void handle_departure(double current_time, double arrival_time, double service_duration, 
-                          priority_queue<Event, vector<Event>, greater<Event>>& pq) {
+    void depart(double t, double arr, double serv,
+                priority_queue<Event, vector<Event>, greater<Event>>& pq,
+                double T) {
         num_in_system--;
-        served_count++;
-        
-        // Update stats
-        // Wait Time = (Departure Time - Service Duration) - Arrival Time
-        // Effectively: Start_Service_Time - Arrival_Time
-        double start_service_time = current_time - service_duration;
-        double wait_time = start_service_time - arrival_time;
-        
-        total_wait_time += wait_time;
-        total_service_time += service_duration;
 
-        // Check if there are more requests in queue
-        if (!waiting_queue.empty()) {
-            // Start processing next one
-            double next_arrival_time = waiting_queue.front();
-            waiting_queue.pop_front();
-            
-            double next_service_time = generate_service_time();
-            
-            // Schedule next departure
-            pq.push(Event(current_time + next_service_time, DEPARTURE, id, next_arrival_time, next_service_time));
-            // busy remains true
+        // Do NOT count requests finishing after T
+        if (t <= T) {
+            served++;
+            double start = t - serv;
+            total_wait += (start - arr);
+            total_service += serv;
+        }
+
+        if (!queue.empty()) {
+            double next_arr = queue.front();
+            queue.pop_front();
+            double next_serv = gen_service_time();
+            pq.push(Event(t + next_serv, DEPARTURE, id, next_arr, next_serv));
+            busy = true;
         } else {
             busy = false;
         }
     }
-
-    double generate_service_time() {
-        exponential_distribution<double> exp_dist(mu_rate);
-        return exp_dist(rng);
-    }
 };
 
-// ********** Helper Functions **********
-
-double generate_interarrival_time(double lambda) {
-    exponential_distribution<double> exp_dist(lambda);
-    return exp_dist(rng);
+// ********** Helpers **********
+double gen_interarrival(double lambda) {
+    exponential_distribution<double> d(lambda);
+    return d(rng);
 }
 
-int pick_server(const vector<double>& probs) {
-    uniform_real_distribution<double> dist(0.0, 1.0);
-    double r = dist(rng);
-    double cumulative = 0.0;
-    for (size_t i = 0; i < probs.size(); ++i) {
-        cumulative += probs[i];
-        if (r <= cumulative) {
-            return i;
-        }
+int pick_server(const vector<double>& P) {
+    uniform_real_distribution<double> d(0.0, 1.0);
+    double r = d(rng), acc = 0.0;
+    for (size_t i = 0; i < P.size(); i++) {
+        acc += P[i];
+        if (r <= acc) return i;
     }
-    return probs.size() - 1; // Fallback for rounding errors
+    return P.size() - 1;
 }
 
 // ********** Main **********
-
 int main(int argc, char* argv[]) {
-    // Seed RNG
     random_device rd;
     rng.seed(rd());
 
-    // 1. Parse Arguments
-    // Expected: ./simulator T M P1...PM lambda Q1...QM mu1...muM
-    
-    // Minimal check: T(1) + M(1) + P(1) + lambda(1) + Q(1) + mu(1) + prog(1) = 7
     if (argc < 7) {
-        cerr << "Usage: ./simulator T M P1...PM lambda Q1...QM mu1...muM" << endl;
+        cerr << "Usage: ./simulator T M P1..PM lambda Q1..QM mu1..muM\n";
         return 1;
     }
 
-    int arg_idx = 1;
-    double T = atof(argv[arg_idx++]);
-    int M = atoi(argv[arg_idx++]);
+    int idx = 1;
+    double T = atof(argv[idx++]);
+    int M = atoi(argv[idx++]);
 
-    // Check if we have enough arguments based on M
-    // We need M probs, 1 lambda, M Qs, M mus
-    if (argc != (3 + M + 1 + M + M)) {
-        cerr << "Error: Incorrect number of arguments for M=" << M << endl;
+    if (argc != 4 + 3 * M) {
+        cerr << "Error: wrong number of arguments for M=" << M << endl;
         return 1;
     }
 
-    vector<double> probs;
-    double prob_sum = 0.0;
-    for (int i = 0; i < M; ++i) {
-        probs.push_back(atof(argv[arg_idx++]));
-        prob_sum += probs.back();
-    }
-    if(abs(prob_sum - 1.0) > 1e-6) {
-        cerr << "Error: Probabilities must sum to 1." << endl;
+    if (T <= 0 || M <= 0) {
+        cerr << "Error: T > 0 and M > 0 required\n";
         return 1;
     }
 
-    double lambda = atof(argv[arg_idx++]);
+    vector<double> P(M);
+    double sumP = 0.0;
+    for (int i = 0; i < M; i++) {
+        P[i] = atof(argv[idx++]);
+        if (P[i] < 0) {
+            cerr << "Error: probabilities must be non-negative\n";
+            return 1;
+        }
+        sumP += P[i];
+    }
 
-    vector<int> queues;
-    for (int i = 0; i < M; ++i) queues.push_back(atoi(argv[arg_idx++]));
+    if (fabs(sumP - 1.0) > 1e-6) {
+        cerr << "Error: probabilities must sum to 1\n";
+        return 1;
+    }
 
-    vector<double> mus;
-    for (int i = 0; i < M; ++i) mus.push_back(atof(argv[arg_idx++]));
+    double lambda = atof(argv[idx++]);
+    if (lambda < 0) {
+        cerr << "Error: lambda must be >= 0\n";
+        return 1;
+    }
 
-    // 2. Setup System
+    vector<int> Q(M);
+    for (int i = 0; i < M; i++) {
+        Q[i] = atoi(argv[idx++]);
+        if (Q[i] < 0) {
+            cerr << "Error: Qi must be >= 0\n";
+            return 1;
+        }
+    }
+
+    vector<double> mu(M);
+    for (int i = 0; i < M; i++) {
+        mu[i] = atof(argv[idx++]);
+        if (mu[i] <= 0) {
+            cerr << "Error: mu_i must be > 0\n";
+            return 1;
+        }
+    }
+
     vector<Server> servers;
-    for (int i = 0; i < M; ++i) {
-        servers.emplace_back(i, queues[i], mus[i]);
-    }
+    for (int i = 0; i < M; i++)
+        servers.emplace_back(i, Q[i], mu[i]);
 
     priority_queue<Event, vector<Event>, greater<Event>> pq;
 
-    // 3. Simulation Loop
-    double current_time = 0.0;
-    double tend = 0.0; // Time of last departure
+    double first = gen_interarrival(lambda);
+    if (first <= T)
+        pq.push(Event(first, ARRIVAL));
 
-    // Schedule first arrival
-    double first_arr = generate_interarrival_time(lambda);
-    if (first_arr <= T) {
-        pq.push(Event(first_arr, ARRIVAL));
-    }
+    double current = 0.0;
+    double endT = 0.0;
 
     while (!pq.empty()) {
         Event e = pq.top();
         pq.pop();
-
-        // Update time
-        current_time = e.time;
+        current = e.time;
 
         if (e.type == ARRIVAL) {
-            // ARRIVALS stop after time T
-            if (current_time > T) continue;
+            if (current > T) continue;
 
-            // 1. Schedule next arrival
-            double next_arr = current_time + generate_interarrival_time(lambda);
-            if (next_arr <= T) {
-                pq.push(Event(next_arr, ARRIVAL));
-            }
+            double next = current + gen_interarrival(lambda);
+            if (next <= T)
+                pq.push(Event(next, ARRIVAL));
 
-            // 2. Route request to a server
-            int server_idx = pick_server(probs);
-            
-            // 3. Try to add to server
-            servers[server_idx].accept_arrival(current_time, pq);
-
-        } else if (e.type == DEPARTURE) {
-            // Handle departure at specific server
-            int s_idx = e.server_index;
-            servers[s_idx].handle_departure(current_time, e.arrival_time, e.service_duration, pq);
-            
-            // Track last departure time
-            if (current_time > tend) tend = current_time;
+            int s = pick_server(P);
+            servers[s].accept(current, pq);
+        } else {
+            servers[e.server_index].depart(
+                current, e.arrival_time, e.service_duration, pq, T);
+            if (current > endT) endT = current;
         }
     }
 
-    // 4. Aggregate Results
-    long long total_A = 0;
-    long long total_B = 0;
-    double total_wait_sum = 0.0;
-    double total_service_sum = 0.0;
+    long long A = 0, B = 0;
+    double Tw = 0.0, Ts = 0.0;
 
-    for (const auto& s : servers) {
-        total_A += s.served_count;
-        total_B += s.dropped_count;
-        total_wait_sum += s.total_wait_time;
-        total_service_sum += s.total_service_time;
+    for (auto& s : servers) {
+        A += s.served;
+        B += s.dropped;
+        Tw += s.total_wait;
+        Ts += s.total_service;
     }
 
-    double avg_Tw = (total_A > 0) ? (total_wait_sum / total_A) : 0.0;
-    double avg_Ts = (total_A > 0) ? (total_service_sum / total_A) : 0.0;
-
-    // 5. Output
+    double avgTw = (A > 0) ? Tw / A : 0.0;
+    double avgTs = (A > 0) ? Ts / A : 0.0;
+    avgTw = max(0.0, avgTw);
     cout << fixed << setprecision(4);
-    cout << total_A << " " << total_B << " " << tend << " " << avg_Tw << " " << avg_Ts << endl;
+    cout << A << " " << B << " " << endT << " "
+         << avgTw << " " << avgTs << endl;
 
     return 0;
 }
