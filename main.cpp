@@ -22,6 +22,7 @@ struct Event {
 
     // Constructor
     Event(double t, EventType tp, double at = 0.0) : time(t), type(tp), arrival_time(at) {}
+
     // comparison operator
     bool operator>(const Event& other) const {
         return time > other.time;
@@ -48,6 +49,9 @@ private:
     int customers_blocked;          // Part of B - customers rejected because queue was full
     int customers_in_system_at_end; // Part of B - customers remaining at end
     double total_time_in_system;    // סכום זמני ההמתנה של כל הלקוחות
+
+    // תור של זמני הגעה אמיתיים של לקוחות
+    queue<double> arrival_times;
 
     // a priorety queue to handle the events , implemented with a vector of events
     // and the comparison func is the built in function greater
@@ -111,14 +115,21 @@ public:
             // There's room in the system
             num_in_system++;
 
+            // שומרים את זמן ההגעה של הלקוח
+            arrival_times.push(current_time);
+
             if (!server_busy) {
                 // Server is idle - start service immediately
                 server_busy = true;
                 double service_time = generate_service_time();
                 double departure_time = current_time + service_time;
 
+                // שולפים את הלקוח שנכנס לשירות
+                double arrival = arrival_times.front();
+                arrival_times.pop();
+
                 // Schedule the service completion
-                schedule_event(departure_time, DEPARTURE, current_time);
+                schedule_event(departure_time, DEPARTURE, arrival);
             }
             // Otherwise - customer enters queue and waits
         } else {
@@ -143,7 +154,12 @@ public:
             // The customer must have been waiting in queue, so start service now
             double service_time = generate_service_time();
             double departure_time = current_time + service_time;
-            schedule_event(departure_time, DEPARTURE, current_time);
+
+            // שולפים את הלקוח הבא מהתור
+            double arrival = arrival_times.front();
+            arrival_times.pop();
+
+            schedule_event(departure_time, DEPARTURE, arrival);
             // Server stays busy
         } else {
             // No more customers - server becomes idle
@@ -206,24 +222,31 @@ void run_experiment() {
     const double lambda = 10.0;
     const double mu = 15.0;
     const int N = 1000;
+
     const double theoretical_avg_wait = 1.0 / (mu - lambda); // M/M/1 approximation
     const double theoretical_A_per_T = lambda;               // E[A] = λ·T
+
     cout << fixed << setprecision(4);
     cout << "T   | Avg RelErr_A (%) | Avg RelErr_W (%)\n";
     cout << "-----------------------------------------\n";
+
     for (int T = 10; T <= 100; T += 10) {
         double sum_err_A = 0.0;
         double sum_err_W = 0.0;
+
         for (int run = 1; run <= 20; ++run) {
             MMN1Queue q(lambda, mu, N, T, run); // use run as seed
             int A, B;
             double avg_wait;
             q.run(A, B, avg_wait);
+
             double err_A = fabs(theoretical_A_per_T * T - A) /(theoretical_A_per_T * T) * 100.0;
             double err_W = fabs(theoretical_avg_wait - avg_wait) /theoretical_avg_wait * 100.0;
+
             sum_err_A += err_A;
             sum_err_W += err_W;
         }
+
         // הדפסת ממוצעים בלבד
         cout << setw(3) << T << " | "
              << setw(15) << sum_err_A / 20.0 << " | "
