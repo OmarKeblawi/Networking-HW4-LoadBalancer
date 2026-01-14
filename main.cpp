@@ -78,18 +78,15 @@ public:
         }
     }
 
+    // Count ALL completed services (even after T)
     void depart(double t, double arr, double serv,
-                priority_queue<Event, vector<Event>, greater<Event>>& pq,
-                double T) {
+                priority_queue<Event, vector<Event>, greater<Event>>& pq) {
         num_in_system--;
 
-        // Do NOT count requests finishing after T
-        if (t <= T) {
-            served++;
-            double start = t - serv;
-            total_wait += (start - arr);
-            total_service += serv;
-        }
+        served++;
+        double start = t - serv;
+        total_wait += (start - arr);
+        total_service += serv;
 
         if (!queue.empty()) {
             double next_arr = queue.front();
@@ -212,7 +209,7 @@ int main(int argc, char* argv[]) {
             servers[s].accept(current, pq);
         } else {
             servers[e.server_index].depart(
-                current, e.arrival_time, e.service_duration, pq, T);
+                current, e.arrival_time, e.service_duration, pq);
             if (current > endT) endT = current;
         }
     }
@@ -230,6 +227,7 @@ int main(int argc, char* argv[]) {
     double avgTw = (A > 0) ? Tw / A : 0.0;
     double avgTs = (A > 0) ? Ts / A : 0.0;
     avgTw = max(0.0, avgTw);
+
     cout << fixed << setprecision(4);
     cout << A << " " << B << " " << endT << " "
          << avgTw << " " << avgTs << endl;
